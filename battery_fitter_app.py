@@ -377,6 +377,287 @@ def find_all_pcb_placements(compartment, items, pcb_l, pcb_w, pcb_h, pcb_gap=0.0
     all_found.sort(key=lambda x: x['face_area'], reverse=True)
     return all_found
 
+
+# ══════════════════════════════════════════════════════════════════
+#  暴露面统一分析框架 (绝缘材料 + PCB 放置)
+# ══════════════════════════════════════════════════════════════════
+
+def _merge_rects(rects_mm, max_gap=1.0):
+    """合并重叠或邻近的矩形 (Union-Find), 用于提取绝缘材料连通区域。
+
+    rects_mm: [(u0, v0, u1, v1), ...]  面电池在贴附面上的投影矩形 (mm)
+    max_gap: 间距 ≤ 此值的矩形合并为一组
+    返回: [(u0, v0, u1, v1), ...]  合并后的包围盒 (mm)
+    """
+    n = len(rects_mm)
+    if n <= 1:
+        return list(rects_mm)
+
+    half = max_gap / 2.0
+    grown = [(u0 - half, v0 - half, u1 + half, v1 + half) for u0, v0, u1, v1 in rects_mm]
+
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for i in range(n):
+        gi0, gv0, gi1, gv1 = grown[i]
+        for j in range(i + 1, n):
+            gj0, gv0_j, gj1, gv1_j = grown[j]
+            if gi0 <= gj1 and gi1 >= gj0 and gv0 <= gv1_j and gv1 >= gv0_j:
+                union(i, j)
+
+    groups = {}
+    for i in range(n):
+        root = find(i)
+        groups.setdefault(root, []).append(i)
+
+    result = []
+    for indices in groups.values():
+        u0 = min(rects_mm[i][0] for i in indices)
+        v0 = min(rects_mm[i][1] for i in indices)
+        u1 = max(rects_mm[i][2] for i in indices)
+        v1 = max(rects_mm[i][3] for i in indices)
+        result.append((u0, v0, u1, v1))
+
+    return result
+
+
+def _analyze_one_face(compartment, batteries, axis, near, wall_pos,
+                      pcb_l, pcb_w, pcb_h, pcb_gap=0.0, resolution=1.0):
+    """分析单个暴露面: 提取绝缘材料组件 并 搜索 PCB 放置位置。
+
+    返回 face dict 或 None (当该面无表面电池时)。
+    PCB 搜索采用 每厚度方向独立阻挡阈值 (thickness + pcb_gap),
+    避免全局 max(pcb_dims) 的过度保守问题。
+    """
+    a1, a2 = [i for i in range(3) if i != axis]
+    u_len = compartment[a1]
+    v_len = compartment[a2]
+
+    grid_u = int(u_len / resolution) + 2
+    grid_v = int(v_len / resolution) + 2
+
+    # ── 构建基础占据网格 (面电池 → 0) ──
+    occ = np.ones((grid_v, grid_u), dtype=np.uint8)
+    on_surf = []
+    surf_rects_mm = []
+    batt_coords = []
+
+    for b in batteries:
+        u0 = int(b['pos'][a1] / resolution) + 1
+        v0 = int(b['pos'][a2] / resolution) + 1
+        u1 = int((b['pos'][a1] + b['dims'][a1]) / resolution) + 1
+        v1 = int((b['pos'][a2] + b['dims'][a2]) / resolution) + 1
+
+        b_start = b['pos'][axis]
+        b_end = b_start + b['dims'][axis]
+
+        if near:
+            on_surface = abs(b_start - wall_pos) < resolution
+        else:
+            on_surface = abs(b_end - wall_pos) < resolution
+
+        batt_coords.append((u0, v0, u1, v1, b_start, on_surface))
+
+        if on_surface:
+            occ[v0:v1, u0:u1] = 0
+            on_surf.append((u0, v0, u1, v1))
+            umm0 = b['pos'][a1]
+            vmm0 = b['pos'][a2]
+            umm1 = umm0 + b['dims'][a1]
+            vmm1 = vmm0 + b['dims'][a2]
+            surf_rects_mm.append((umm0, vmm0, umm1, vmm1))
+
+    if not on_surf:
+        return None
+
+    # ── 绝缘材料组件: 合并邻近面电池投影矩形 ──
+    merge_gap = max(pcb_gap, 1.0)
+    merged = _merge_rects(surf_rects_mm, merge_gap)
+    components = []
+    for u0, v0, u1, v1 in merged:
+        w = u1 - u0
+        h = v1 - v0
+        components.append({'u': u0, 'v': v0, 'w': w, 'h': h, 'area': w * h})
+
+    # ── 全局包围盒填充 (PCB 可跨接缝隙) ──
+    rmin = min(v0 for _, v0, _, _ in on_surf)
+    rmax = max(v1 for _, _, _, v1 in on_surf)
+    cmin = min(u0 for u0, _, _, _ in on_surf)
+    cmax = max(u1 for _, _, u1, _ in on_surf)
+    occ[rmin:rmax, cmin:cmax] = 0
+
+    # ── 暴露性判断: 远端面是否被后排电池完全遮挡? ──
+    exposed = True
+    if not near:
+        occ_check = occ.copy()
+        block_rects = []
+        for u0, v0, u1, v1, b_start, on_surface in batt_coords:
+            if not on_surface and b_start > wall_pos:
+                occ_check[v0:v1, u0:u1] = 1
+                block_rects.append((u0, v0, u1, v1))
+        # 阻挡电池也需要 bbox fill, 覆盖电池间隙
+        if block_rects:
+            brmin = min(v0 for _, v0, _, _ in block_rects)
+            brmax = max(v1 for _, _, _, v1 in block_rects)
+            bcmin = min(u0 for u0, _, _, _ in block_rects)
+            bcmax = max(u1 for _, _, u1, _ in block_rects)
+            occ_check[brmin:brmax, bcmin:bcmax] = 1
+        # 填充区内无可暴露像素 → 纯内部面
+        if not np.any(occ_check[rmin:rmax, cmin:cmax] == 0):
+            exposed = False
+
+    # ── PCB 搜索: 每厚度方向独立阻挡阈值 ──
+    axis_names = {0: 'Length', 1: 'Width', 2: 'Height'}
+    has_pcb = pcb_l > 0 and pcb_w > 0 and pcb_h > 0
+    pcb_info = None
+
+    if has_pcb:
+        pcb_dims_list = [pcb_l, pcb_w, pcb_h]
+        thick_order = sorted(range(3), key=lambda i:
+            pcb_dims_list[(i + 1) % 3] * pcb_dims_list[(i + 2) % 3], reverse=True)
+
+        for thick_idx in thick_order:
+            thickness = pcb_dims_list[thick_idx]
+            face_dims = [pcb_dims_list[i] for i in range(3) if i != thick_idx]
+            fw, fh = face_dims
+
+            # 为当前厚度标记阻挡电池
+            occ_thick = occ.copy()
+            if not near:
+                for u0, v0, u1, v1, b_start, on_surface in batt_coords:
+                    if not on_surface and b_start > wall_pos and b_start - wall_pos < thickness + pcb_gap:
+                        occ_thick[v0:v1, u0:u1] = 1
+
+            integral = occ_thick.cumsum(axis=0).cumsum(axis=1).astype(np.int64)
+
+            for rot in [False, True]:
+                w, h = (fh, fw) if rot else (fw, fh)
+                w_cells = max(1, int((w + 2 * pcb_gap) / resolution))
+                h_cells = max(1, int((h + 2 * pcb_gap) / resolution))
+                if w_cells >= grid_u or h_cells >= grid_v:
+                    continue
+
+                if near:
+                    max_ext = max(b['pos'][axis] + b['dims'][axis] for b in batteries)
+                    if max_ext + thickness + pcb_gap > compartment[axis]:
+                        continue
+                else:
+                    if thickness + pcb_gap > compartment[axis] - wall_pos:
+                        continue
+
+                for i in range(grid_v - h_cells):
+                    for j in range(grid_u - w_cells):
+                        i2, j2 = i + h_cells - 1, j + w_cells - 1
+                        s = integral[i2, j2]
+                        if i > 0:
+                            s -= integral[i - 1, j2]
+                        if j > 0:
+                            s -= integral[i2, j - 1]
+                        if i > 0 and j > 0:
+                            s += integral[i - 1, j - 1]
+                        if s == 0:
+                            pcb_info = {
+                                'dims': (pcb_l, pcb_w, pcb_h),
+                                'face': (w, h),
+                                'thickness': thickness,
+                                'axis': axis,
+                                'axis_name': axis_names[axis],
+                                'near': near,
+                                'wall_pos': wall_pos,
+                                'gap': pcb_gap,
+                                'u_pos': max(0.0, (j - 1) * resolution + pcb_gap),
+                                'v_pos': max(0.0, (i - 1) * resolution + pcb_gap),
+                            }
+                            break
+                    if pcb_info:
+                        break
+                if pcb_info:
+                    break
+            if pcb_info:
+                break
+
+    face_area = sum(c['area'] for c in components)
+    return {
+        'axis': axis,
+        'axis_name': axis_names[axis],
+        'near': near,
+        'wall_pos': wall_pos,
+        'exposed': exposed,
+        'components': components,
+        'face_area': face_area,
+        'pcb_info': pcb_info,
+    }
+
+
+def find_all_exposed_faces(compartment, items, pcb_l, pcb_w, pcb_h, pcb_gap=0.0, resolution=1.0):
+    """扫描所有电池暴露面, 返回绝缘材料 + PCB 放置的统一信息。
+
+    对每个轴的每个不同电池终止位置 (阶梯排列产生多层暴露面),
+    调用 _analyze_one_face 提取绝缘组件和 PCB 可放置位置。
+    """
+    batteries = [it for it in items if it['kind'] == 'battery']
+    if not batteries:
+        return []
+
+    all_faces = []
+    for axis in range(3):
+        axis_zh = AXIS_LABELS_ZH[axis]
+        coord_name = AXIS_COORD_ZH[axis]
+
+        # 远端面: 扫描所有终止位置, 由 _analyze_one_face 过滤内部面
+        end_positions = sorted(set(
+            b['pos'][axis] + b['dims'][axis] for b in batteries
+        ), reverse=True)
+        for wp in end_positions:
+            face = _analyze_one_face(compartment, batteries, axis, False, wp,
+                                     pcb_l, pcb_w, pcb_h, pcb_gap, resolution)
+            if face:
+                face['label'] = f"{axis_zh} ({coord_name}={wp:.0f}) — {face['axis_name']}面"
+                all_faces.append(face)
+
+        # 近端面: 电池起始面
+        face = _analyze_one_face(compartment, batteries, axis, True, 0.0,
+                                 pcb_l, pcb_w, pcb_h, pcb_gap, resolution)
+        if face:
+            face['label'] = f"{axis_zh} ({coord_name}=0) — {face['axis_name']}面 (近端)"
+            all_faces.append(face)
+
+    all_faces.sort(key=lambda x: x['face_area'], reverse=True)
+    return all_faces
+
+
+# ── 序列化辅助函数 (模块级, 供回调和惰性计算共用) ──
+
+def _tuplify(v):
+    if isinstance(v, (int, float, str, bool, type(None), list, dict)):
+        return v
+    return list(v)
+
+
+def _serialize_face(face):
+    """序列化暴露面 dict 为 JSON-safe 格式。"""
+    result = {}
+    for k, v in face.items():
+        if k == 'components':
+            result['components'] = [{kk: _tuplify(vv) for kk, vv in c.items()} for c in v]
+        elif k == 'pcb_info':
+            result['pcb_info'] = {kk: _tuplify(vv) for kk, vv in v.items()} if v else None
+        else:
+            result[k] = _tuplify(v)
+    return result
+
+
 def generate_items(compartment, arrangement, pcb_info=None, center=True):
     """生成电池和 PCB 的位置列表。
 
@@ -532,7 +813,9 @@ def add_compartment_wireframe(fig, l, w, h, color='gray'):
     ))
 
 def build_3d_figure(compartment, items, pcb_block, margin_info, results_text,
-                     raw_comp=(0,0,0), comp_color='gray', can_fit=True):
+                     raw_comp=(0,0,0), comp_color='gray', can_fit=True,
+                     highlight_face=None, insulation_faces=None,
+                     center_offset=(0, 0, 0)):
     cl, cw, ch = compartment
     fig = go.Figure()
     add_compartment_wireframe(fig, cl, cw, ch, color=comp_color)
@@ -561,6 +844,110 @@ def build_3d_figure(compartment, items, pcb_block, margin_info, results_text,
             line=dict(color='darkred', width=4),
             showlegend=False, hoverinfo='skip',
         ))
+
+    # 高亮当前选中暴露面: 半透明金色矩形
+    if highlight_face and highlight_face.get('components'):
+        comps = highlight_face['components']
+        axis = highlight_face['axis']
+        wall_pos = highlight_face['wall_pos']
+        u_axis, v_axis = [i for i in range(3) if i != axis]
+
+        u_min = min(c['u'] for c in comps)
+        u_max = max(c['u'] + c['w'] for c in comps)
+        v_min = min(c['v'] for c in comps)
+        v_max = max(c['v'] + c['h'] for c in comps)
+        u_size = u_max - u_min
+        v_size = v_max - v_min
+
+        # 应用居中偏移
+        wall_pos += center_offset[axis]
+        u_min += center_offset[u_axis]
+        v_min += center_offset[v_axis]
+
+        hl_thin = 0.3  # 高亮面厚度 (纯视觉)
+        x_hl = y_hl = z_hl = 0.0
+        dx_hl = dy_hl = dz_hl = 0.0
+
+        if axis == 0:
+            x_hl, y_hl, z_hl = wall_pos - hl_thin / 2, u_min, v_min
+            dx_hl, dy_hl, dz_hl = hl_thin, u_size, v_size
+        elif axis == 1:
+            x_hl, y_hl, z_hl = u_min, wall_pos - hl_thin / 2, v_min
+            dx_hl, dy_hl, dz_hl = u_size, hl_thin, v_size
+        else:
+            x_hl, y_hl, z_hl = u_min, v_min, wall_pos - hl_thin / 2
+            dx_hl, dy_hl, dz_hl = u_size, v_size, hl_thin
+
+        v_hl = box_vertices(x_hl, y_hl, z_hl, dx_hl, dy_hl, dz_hl)
+        fig.add_trace(go.Mesh3d(
+            x=v_hl[:, 0], y=v_hl[:, 1], z=v_hl[:, 2],
+            i=_CUBE_TRIS[:, 0], j=_CUBE_TRIS[:, 1], k=_CUBE_TRIS[:, 2],
+            facecolor=['rgba(255,215,0,0.25)'] * 12, opacity=0.35,
+            name='Selected Face', showlegend=True, hoverinfo='name',
+        ))
+        xs_hl, ys_hl, zs_hl = box_wireframe(x_hl, y_hl, z_hl, dx_hl, dy_hl, dz_hl)
+        fig.add_trace(go.Scatter3d(
+            x=xs_hl, y=ys_hl, z=zs_hl, mode='lines',
+            line=dict(color='gold', width=3),
+            showlegend=False, hoverinfo='skip',
+        ))
+
+    # 绝缘片可视化: 每个面一个 trace (图例中点击可独立开关)
+    if insulation_faces:
+        insul_colors = [
+            'rgba(255,140,0,0.4)', 'rgba(0,180,200,0.4)', 'rgba(180,0,220,0.4)',
+            'rgba(50,200,50,0.4)', 'rgba(220,80,80,0.4)', 'rgba(80,80,220,0.4)',
+            'rgba(200,180,0,0.4)', 'rgba(200,100,180,0.4)', 'rgba(0,150,100,0.4)',
+            'rgba(150,100,50,0.4)', 'rgba(100,100,100,0.4)', 'rgba(200,150,100,0.4)',
+        ]
+        border_colors = [
+            'darkorange', 'darkcyan', 'darkorchid',
+            'darkgreen', 'firebrick', 'darkblue',
+            'darkgoldenrod', 'deeppink', 'teal',
+            'saddlebrown', 'dimgray', 'chocolate',
+        ]
+        for fi, face in enumerate(insulation_faces):
+            comps = face.get('components', [])
+            if not comps:
+                continue
+            axis = face['axis']
+            wall_pos = face['wall_pos'] + center_offset[axis]
+            ua, va = [i for i in range(3) if i != axis]
+            fc = insul_colors[fi % len(insul_colors)]
+            bc = border_colors[fi % len(border_colors)]
+            label = face.get('label', f'Face {fi+1}')
+            for ci, comp in enumerate(comps):
+                u = comp['u'] + center_offset[ua]
+                v = comp['v'] + center_offset[va]
+                w, h = comp['w'], comp['h']
+                x_i = y_i = z_i = 0.0
+                dx_i = dy_i = dz_i = 0.0
+                thick = 0.5
+                if axis == 0:
+                    x_i, y_i, z_i = wall_pos - thick / 2, u, v
+                    dx_i, dy_i, dz_i = thick, w, h
+                elif axis == 1:
+                    x_i, y_i, z_i = u, wall_pos - thick / 2, v
+                    dx_i, dy_i, dz_i = w, thick, h
+                else:
+                    x_i, y_i, z_i = u, v, wall_pos - thick / 2
+                    dx_i, dy_i, dz_i = w, h, thick
+
+                vi = box_vertices(x_i, y_i, z_i, dx_i, dy_i, dz_i)
+                fig.add_trace(go.Mesh3d(
+                    x=vi[:, 0], y=vi[:, 1], z=vi[:, 2],
+                    i=_CUBE_TRIS[:, 0], j=_CUBE_TRIS[:, 1], k=_CUBE_TRIS[:, 2],
+                    facecolor=[fc] * 12, opacity=0.5,
+                    name=label, showlegend=(ci == 0),
+                    hoverinfo='name', legendgroup=label,
+                ))
+                xs_i, ys_i, zs_i = box_wireframe(x_i, y_i, z_i, dx_i, dy_i, dz_i)
+                fig.add_trace(go.Scatter3d(
+                    x=xs_i, y=ys_i, z=zs_i, mode='lines',
+                    line=dict(color=bc, width=2.5),
+                    showlegend=False, hoverinfo='skip',
+                    legendgroup=label,
+                ))
 
     max_extent = max(cl, cw, ch)
     # 如果有原始尺寸(含 margin), 用原始尺寸当边界
@@ -832,6 +1219,29 @@ app.layout = html.Div([
                          style={'marginTop': '4px'}),
             ], style=SECTION_STYLE),
 
+            # 绝缘材料 / BOM
+            html.Div([
+                html.H4("材料清单 BOM", style={'margin': '0 0 6px 0', 'color': '#2c3e50'}),
+                html.Div([
+                    labeled_input("绝缘 (元/cm²)", "material-cost", 0.05, 0, 10, 0.01),
+                    labeled_input("PCB (元/片)", "pcb-price", 15, 0, 1000, 1),
+                    labeled_input("电池 (元/节)", "batt-price", 8, 0, 1000, 1),
+                ], style={'display': 'flex', 'gap': '4px'}),
+                dcc.Checklist(
+                    id='show-insulation',
+                    options=[{'label': ' 可视化绝缘片', 'value': 'show'}],
+                    value=[],
+                    style={'fontSize': '12px', 'marginTop': '4px'},
+                ),
+                html.Div(id='insulation-panel', style={
+                    'fontSize': '11px', 'fontFamily': 'monospace', 'whiteSpace': 'pre-line',
+                    'minHeight': '20px', 'marginTop': '4px', 'color': '#555',
+                }),
+                html.Button('导出 BOM (CSV)', id='btn-export-bom',
+                           style={'marginTop': '6px', 'fontSize': '11px', 'padding': '4px 10px'}),
+                dcc.Download(id='download-bom'),
+            ], style=SECTION_STYLE),
+
             # 排列方案选择
             html.Div([
                 html.Label("排列方案 (点击切换)", style={'fontSize': '12px', 'fontWeight': 'bold',
@@ -954,22 +1364,26 @@ def compute_and_summarize(cl, cw, ch, margin, bl, bw, bh, bgap,
     has_pcb = pcb_l > 0 and pcb_w > 0 and pcb_h > 0
 
     # ── 仅切换贴附面: 从缓存更新选中项 ──
-    if (ctx.triggered_id == 'pcb-face' and old_cache is not None
-            and 'all_pcb_placements' in old_cache):
+    # 必须确认仅 pcb-face 变化 (加载预设时多个参数同时变化应走完整重算)
+    triggered_ids = [t['prop_id'].split('.')[0] for t in ctx.triggered]
+    only_face = (len(triggered_ids) == 1 and triggered_ids[0] == 'pcb-face')
+    if (only_face and old_cache is not None
+            and 'exposed_faces' in old_cache):
         c = old_cache
-        placements = c['all_pcb_placements']
+        faces = c['exposed_faces']  # 仅外表面
         idx = pcb_face if isinstance(pcb_face, (int, float)) else 0
-        idx = max(0, min(int(idx), len(placements) - 1)) if placements else 0
-        pcb_info = placements[idx] if placements else None
+        idx = max(0, min(int(idx), len(faces) - 1)) if faces else 0
+        selected_face = faces[idx] if faces else None
+        pcb_info = selected_face['pcb_info'] if selected_face else None
         new_cache = dict(c)
-        new_cache['selected_pcb_idx'] = idx
+        new_cache['selected_face_idx'] = idx
         new_cache['pcb_info'] = pcb_info
         new_cache['pcb_near'] = pcb_info['near'] if pcb_info else False
 
         # 更新缓存并重建结果文本
         n_needed = c['n_needed']
         can_fit = c['all_arrangements'][0]['total'] >= n_needed
-        face_opts = [{'label': p['label'], 'value': i} for i, p in enumerate(placements)]
+        face_opts = [{'label': f.get('label', f'面 {i+1}'), 'value': i} for i, f in enumerate(faces)]
 
         # 从旧缓存重建结果文本, 更新 PCB 面信息
         old_text = c.get('_results_text', '')
@@ -1002,25 +1416,60 @@ def compute_and_summarize(cl, cw, ch, margin, bl, bw, bh, bgap,
         return fail(f'电池({bl}×{bw}×{bh})太大, 一节也放不进')
 
     eff_compartment = compartment
-    all_placements = []
-    pcb_info = None
-    if has_pcb:
-        best_arr = {k: v for k, v in all_arrangements[0].items()
-                    if k not in ('total', 'label')}
-        items_for_pcb, _ = generate_items(compartment, best_arr, center=False)
-        all_placements = find_all_pcb_placements(compartment, items_for_pcb,
-                                                  pcb_l, pcb_w, pcb_h, pcb_gap_f)
-        if not all_placements:
-            return fail(f'保护板({pcb_l}×{pcb_w}×{pcb_h})在所有面上都放不下')
-        pcb_info = all_placements[0]
-        pcb_near = pcb_info['near']
-    else:
-        pcb_near = False
 
-    # ═══ 电参数: S×P ═══
+    # ═══ 电参数 S×P (提前计算, 暴露面扫描需截断到实际用量) ═══
     s_needed = max(1, int(np.ceil(tv / bv)))
     p_needed = max(1, int(np.ceil(tah / bah)))
     n_needed = s_needed * p_needed
+
+    # 暴露面扫描: 惰性计算 — 仅算最佳排列, 其余切换时按需计算
+    pcb_pcb_l = pcb_l if has_pcb else 0
+    pcb_pcb_w = pcb_w if has_pcb else 0
+    pcb_pcb_h = pcb_h if has_pcb else 0
+
+    def _compute_faces_for_arr(arr):
+        arr_dict = {k: v for k, v in arr.items() if k not in ('total', 'label')}
+        items_a, _ = generate_items(compartment, arr_dict, center=False)
+        items_a = items_a[:n_needed]
+        faces_a = find_all_exposed_faces(compartment, items_a,
+                                         pcb_pcb_l, pcb_pcb_w, pcb_pcb_h, pcb_gap_f)
+        exposed_a = [f for f in faces_a if f.get('exposed', True)
+                     and f.get('pcb_info') is not None]
+        return faces_a, exposed_a
+
+    # 初始化 map (只算 index 0, 其余为 None 表示未计算)
+    all_arr_faces_list = [None] * len(all_arrangements)
+    all_arr_exposed_list = [None] * len(all_arrangements)
+    all_faces, exposed_faces = _compute_faces_for_arr(all_arrangements[0])
+    all_arr_faces_list[0] = all_faces
+    all_arr_exposed_list[0] = exposed_faces
+
+    face_idx = 0
+    pcb_info = None
+
+    if has_pcb:
+        if not exposed_faces:
+            return fail(f'保护板({pcb_l}×{pcb_w}×{pcb_h})在所有面上都放不下')
+
+        if old_cache and 'exposed_faces' in old_cache:
+            old_exposed = old_cache.get('exposed_faces', [])
+            old_idx = old_cache.get('selected_face_idx', 0)
+            if old_exposed and 0 <= old_idx < len(old_exposed):
+                old_face = old_exposed[old_idx]
+                old_key = (old_face.get('axis'), old_face.get('near'))
+                for i, f in enumerate(exposed_faces):
+                    if (f['axis'], f['near']) == old_key:
+                        face_idx = i
+                        break
+
+        pcb_info = exposed_faces[face_idx].get('pcb_info')
+        if pcb_info is None:
+            for i, f in enumerate(exposed_faces):
+                if f.get('pcb_info'):
+                    pcb_info = f['pcb_info']
+                    face_idx = i
+                    break
+    pcb_near = pcb_info['near'] if pcb_info else False
 
     # 过滤可行方案
     feasible = [a for a in all_arrangements if a['total'] >= n_needed]
@@ -1081,20 +1530,24 @@ def compute_and_summarize(cl, cw, ch, margin, bl, bw, bh, bgap,
     results_text = "\n".join(lines)
 
     # 序列化缓存 (不含 items — 由回调 B 按需生成)
-    def tuplify(v):
-        if isinstance(v, (int, float, str, bool, type(None), list, dict)):
-            return v
-        return list(v)
 
     cache = {
-        'all_arrangements': [{k: tuplify(v) for k, v in a.items()} for a in all_arrangements],
+        'all_arrangements': [{k: _tuplify(v) for k, v in a.items()} for a in all_arrangements],
         'compartment': list(compartment), 'raw_comp': list(raw_comp),
         'eff_compartment': list(eff_compartment),
-        'all_pcb_placements': [{k: tuplify(v) for k, v in p.items()} for p in all_placements],
-        'selected_pcb_idx': 0,
-        'pcb_info': {k: tuplify(v) for k, v in pcb_info.items()} if pcb_info else None,
+        # 每个排列的暴露面 (切换排列时直接索引)
+        'all_exposed_faces_map': [[_serialize_face(f) for f in fa] if fa is not None else None
+                                  for fa in all_arr_faces_list],
+        'exposed_faces_map': [[_serialize_face(f) for f in fa] if fa is not None else None
+                               for fa in all_arr_exposed_list],
+        # 当前选中排列的面 (默认 index 0)
+        'all_exposed_faces': [_serialize_face(f) for f in all_faces],
+        'exposed_faces': [_serialize_face(f) for f in exposed_faces],
+        'selected_face_idx': face_idx if has_pcb else 0,
+        'pcb_info': {k: _tuplify(v) for k, v in pcb_info.items()} if pcb_info else None,
         'margin': margin, 'bgap': bgap, 'has_pcb': has_pcb,
         'pcb_near': pcb_near,
+        'pcb_dims_lazy': [pcb_l, pcb_w, pcb_h, pcb_gap_f],  # 惰性计算用
         'n_needed': n_needed, 'can_fit': can_fit, 'vol_exceeded': vol_exceeded,
         '_results_text': results_text,
     }
@@ -1107,12 +1560,12 @@ def compute_and_summarize(cl, cw, ch, margin, bl, bw, bh, bgap,
         dropdown_opts.append({'label': label, 'value': i})
 
     face_opts = []
-    for i, p in enumerate(all_placements):
-        face_opts.append({'label': p.get('label', f'面 {i+1}'), 'value': i})
+    for i, f in enumerate(exposed_faces):
+        face_opts.append({'label': f.get('label', f'面 {i+1}'), 'value': i})
 
     panel_kind = 'ok' if can_fit else ('error' if total < n_needed else 'warn')
     return (cache, dropdown_opts, 0, _result_div(results_text, panel_kind),
-            face_opts, 0)
+            face_opts, face_idx if has_pcb else 0)
 
 
 # ═══ 回调 B: 排列方案切换 → 仅重建 3D/2D 图形 ═══
@@ -1121,8 +1574,9 @@ def compute_and_summarize(cl, cw, ch, margin, bl, bw, bh, bgap,
     Output('2d-graph', 'figure'),
     Input('fit-cache', 'data'),
     Input('arrangement-select', 'value'),
+    Input('show-insulation', 'value'),
 )
-def render_selected(cache, arr_idx):
+def render_selected(cache, arr_idx, show_insulation):
     """仅重建 3D/2D 图形 — 参数变化或切换排列方案时触发。"""
     empty = go.Figure()
 
@@ -1149,6 +1603,32 @@ def render_selected(cache, arr_idx):
 
     items, pcb_block = generate_items(compartment, arrangement, pcb_info)
 
+    # 计算居中偏移 (绝缘片可视化需要)
+    items_raw, _ = generate_items(compartment, arrangement, center=False)
+    center_offset = [0, 0, 0]
+    if items_raw:
+        max_ext = [0, 0, 0]
+        for it in items_raw:
+            for a in range(3):
+                e = it['pos'][a] + it['dims'][a]
+                if e > max_ext[a]:
+                    max_ext[a] = e
+        if pcb_block:
+            for a in range(3):
+                e = pcb_block['pos'][a] + pcb_block['dims'][a]
+                if e > max_ext[a]:
+                    max_ext[a] = e
+        center_offset = tuple(max(0, (compartment[a] - max_ext[a]) / 2) for a in range(3))
+
+    # 提取当前选中暴露面用于 3D 高亮 (按排列索引切换)
+    highlight_face = None
+    exposed_maps = cache.get('exposed_faces_map', [])
+    if exposed_maps and 0 <= arr_idx < len(exposed_maps):
+        exposed_faces_cache = exposed_maps[arr_idx]
+        face_idx = cache.get('selected_face_idx', 0)
+        if exposed_faces_cache and 0 <= face_idx < len(exposed_faces_cache):
+            highlight_face = exposed_faces_cache[face_idx]
+
     can_fit = total >= n_needed
     status = "✓ 满足" if can_fit else "✗ 不满足"
     display_items = items[:n_needed] if can_fit else items
@@ -1161,12 +1641,181 @@ def render_selected(cache, arr_idx):
         title = f"Fits: {total} (need {n_needed})  |  {status}"
 
     comp_color = 'red' if (not can_fit or vol_exceeded) else 'gray'
+    # 绝缘片可视化 (总开关, 每个面在 3D 图例中独立开关)
+    insulation_faces = None
+    if show_insulation and 'show' in (show_insulation or []):
+        insulation_faces = cache.get('all_exposed_faces', [])
+
     fig_3d = build_3d_figure(compartment, display_items, pcb_block,
                              f"(margin={margin})" if margin > 0 else "",
                              title, raw_comp,
-                             comp_color=comp_color, can_fit=can_fit)
+                             comp_color=comp_color, can_fit=can_fit,
+                             highlight_face=highlight_face,
+                             insulation_faces=insulation_faces,
+                             center_offset=center_offset)
     fig_2d = build_2d_figure(compartment, display_items, pcb_block, comp_color=comp_color)
     return fig_3d, fig_2d
+
+
+# ═══ 回调 B2: 切换排列方案 → 更新面数据和下拉菜单 ═══
+@app.callback(
+    Output('fit-cache', 'data', allow_duplicate=True),
+    Output('pcb-face', 'options', allow_duplicate=True),
+    Output('pcb-face', 'value', allow_duplicate=True),
+    Input('arrangement-select', 'value'),
+    State('fit-cache', 'data'),
+    prevent_initial_call=True,
+)
+def switch_arrangement_faces(arr_idx, cache):
+    if cache is None or 'all_exposed_faces_map' not in cache:
+        raise dash.exceptions.PreventUpdate
+    arr_idx = arr_idx or 0
+    all_maps = list(cache.get('all_exposed_faces_map', []))
+    exposed_maps = list(cache.get('exposed_faces_map', []))
+    if arr_idx >= len(all_maps) or arr_idx >= len(exposed_maps):
+        raise dash.exceptions.PreventUpdate
+
+    # 惰性计算: 如果该排列未计算过, 现在计算
+    if all_maps[arr_idx] is None:
+        compartment = tuple(cache['compartment'])
+        arr = cache['all_arrangements'][arr_idx]
+        pcb_p = cache.get('pcb_dims_lazy', [0, 0, 0, 0])
+        pcb_lz, pcb_wz, pcb_hz, pcb_gz = pcb_p
+        n = cache.get('n_needed', 0)
+
+        arr_dict = {k: v for k, v in arr.items() if k not in ('total', 'label')}
+        items_a, _ = generate_items(compartment, arr_dict, center=False)
+        items_a = items_a[:n]
+        faces_a = find_all_exposed_faces(compartment, items_a,
+                                         pcb_lz, pcb_wz, pcb_hz, pcb_gz)
+        exposed_a = [f for f in faces_a if f.get('exposed', True)
+                     and f.get('pcb_info') is not None]
+
+        all_maps[arr_idx] = [_serialize_face(f) for f in faces_a]
+        exposed_maps[arr_idx] = [_serialize_face(f) for f in exposed_a]
+        # 同时更新 cache 中的 map
+        cache['all_exposed_faces_map'] = all_maps
+        cache['exposed_faces_map'] = exposed_maps
+
+    new_cache = dict(cache)
+    new_cache['all_exposed_faces'] = all_maps[arr_idx]
+    new_cache['exposed_faces'] = exposed_maps[arr_idx]
+
+    new_exposed = exposed_maps[arr_idx]
+    face_opts = [{'label': f.get('label', f'面 {i+1}'), 'value': i}
+                 for i, f in enumerate(new_exposed)]
+
+    old_idx = cache.get('selected_face_idx', 0)
+    if old_idx >= len(new_exposed):
+        old_idx = 0
+    new_cache['selected_face_idx'] = old_idx
+
+    if new_exposed and old_idx < len(new_exposed):
+        new_cache['pcb_info'] = new_exposed[old_idx].get('pcb_info')
+        if new_cache['pcb_info']:
+            new_cache['pcb_near'] = new_cache['pcb_info'].get('near', False)
+
+    return new_cache, face_opts, old_idx
+
+
+# ═══ 回调 C: 绝缘材料面板更新 ═══
+@app.callback(
+    Output('insulation-panel', 'children'),
+    Input('fit-cache', 'data'),
+    Input('material-cost', 'value'),
+)
+def update_insulation_panel(cache, cost_per_cm2):
+    """绝缘材料摘要。"""
+    if cache is None or 'all_exposed_faces' not in cache:
+        return "无绝缘信息"
+
+    all_faces_cache = cache.get('all_exposed_faces', [])
+
+    try:
+        cost_per_cm2 = float(cost_per_cm2) if cost_per_cm2 else 0.05
+    except (TypeError, ValueError):
+        cost_per_cm2 = 0.05
+
+    all_pieces = []
+    for f in all_faces_cache:
+        for c in f.get('components', []):
+            all_pieces.append(c)
+
+    total_area = sum(c['area'] for c in all_pieces)
+    total_cm2 = total_area / 100.0
+
+    return (f"绝缘片: {len(all_pieces)} 片  总面积: {total_area:.0f} mm² ({total_cm2:.2f} cm²)"
+            f"  成本: ¥{total_cm2 * cost_per_cm2:.2f}")
+
+
+# ═══ 回调 D: 导出 BOM (CSV) ═══
+@app.callback(
+    Output('download-bom', 'data'),
+    Input('btn-export-bom', 'n_clicks'),
+    State('fit-cache', 'data'),
+    State('material-cost', 'value'),
+    State('pcb-price', 'value'),
+    State('batt-price', 'value'),
+    prevent_initial_call=True,
+)
+def export_bom(n_clicks, cache, cost_per_cm2, pcb_price, batt_price):
+    if cache is None:
+        raise dash.exceptions.PreventUpdate
+    try:
+        cost_per_cm2 = float(cost_per_cm2) if cost_per_cm2 else 0.05
+        pcb_price = float(pcb_price) if pcb_price else 15
+        batt_price = float(batt_price) if batt_price else 8
+    except (TypeError, ValueError):
+        cost_per_cm2, pcb_price, batt_price = 0.05, 15, 8
+
+    import io, csv
+    from collections import defaultdict
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['类型', '尺寸 (mm)', '面积 (mm²)', '所属面', '数量', '单价', '小计'])
+
+    total = 0
+    n = cache.get('n_needed', 0)
+    pcb_info = cache.get('pcb_info')
+    arr = cache.get('all_arrangements', [{}])[0]
+    orient = arr.get('orient') or arr.get('orient1') or (0, 0, 0)
+
+    # 电池
+    bsize = f'{orient[0]:.0f}×{orient[1]:.0f}×{orient[2]:.0f}'
+    writer.writerow(['电池', bsize, '', '', n, f'{batt_price:.2f}', f'{n * batt_price:.2f}'])
+    total += n * batt_price
+
+    # PCB
+    if pcb_info and cache.get('has_pcb'):
+        d = pcb_info.get('dims', (0, 0, 0))
+        psize = f'{d[0]:.0f}×{d[1]:.0f}×{d[2]:.0f}'
+        writer.writerow(['保护板', psize, '', pcb_info.get('axis_name', ''), 1, f'{pcb_price:.2f}', f'{pcb_price:.2f}'])
+        total += pcb_price
+
+    # 绝缘片: 相同尺寸合并
+    all_faces = cache.get('all_exposed_faces', [])
+    insul_groups = defaultdict(lambda: {'count': 0, 'faces': set(), 'area': 0})
+    for face in all_faces:
+        for c in face.get('components', []):
+            key = f'{c["w"]:.0f}×{c["h"]:.0f}'
+            insul_groups[key]['count'] += 1
+            insul_groups[key]['faces'].add(face.get('label', '?'))
+            insul_groups[key]['area'] = c['area']
+
+    for size, g in sorted(insul_groups.items()):
+        area = g['area']
+        piece_cost = (area / 100.0) * cost_per_cm2
+        faces_str = ', '.join(sorted(g['faces']))
+        writer.writerow(['绝缘片', size, f'{area:.0f}', faces_str,
+                        g['count'], f'{piece_cost:.2f}', f'{piece_cost * g["count"]:.2f}'])
+        total += piece_cost * g['count']
+
+    writer.writerow([])
+    writer.writerow(['', '', '', '', '', '总计', f'{total:.2f}'])
+
+    content = output.getvalue().encode('utf-8')
+    return dcc.send_bytes(b'\xef\xbb\xbf' + content, filename='battery_bom.csv')
 
 
 # ============================================================
@@ -1178,6 +1827,7 @@ _PARAM_IDS = [
     'batt-l', 'batt-w', 'batt-h', 'batt-v', 'batt-ah', 'batt-gap',
     'target-v', 'target-ah',
     'pcb-l', 'pcb-w', 'pcb-h', 'pcb-gap', 'pcb-face',
+    'material-cost', 'pcb-price', 'batt-price',
 ]
 
 _NUM_PARAM_IDS = len(_PARAM_IDS)
@@ -1220,15 +1870,8 @@ def handle_presets(btn_save, btn_load, btn_delete, preset_name, preset_select, *
             opts = build_opts(presets)
             return [opts, html.Span('⚠ 请输入预设名称', style={'color': '#dc3545'})] + noop[2:]
         name = preset_name.strip()
-        presets[name] = {
-            'comp-l': input_values[0], 'comp-w': input_values[1], 'comp-h': input_values[2],
-            'margin': input_values[3],
-            'batt-l': input_values[4], 'batt-w': input_values[5], 'batt-h': input_values[6],
-            'batt-v': input_values[7], 'batt-ah': input_values[8], 'batt-gap': input_values[9],
-            'target-v': input_values[10], 'target-ah': input_values[11],
-            'pcb-l': input_values[12], 'pcb-w': input_values[13], 'pcb-h': input_values[14],
-            'pcb-gap': input_values[15], 'pcb-face': input_values[16],
-        }
+        presets[name] = {_PARAM_IDS[i]: input_values[i]
+                         for i in range(len(_PARAM_IDS))}
         save_presets(presets)
         opts = build_opts(presets)
         return [opts, html.Span(f'✅ 已保存 "{name}"', style={'color': '#28a745'})] + noop[2:]

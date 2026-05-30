@@ -16,10 +16,10 @@
     "pcb-w": 30,
     "pcb-h": 3,
     "pcb-gap": 1,
-    "pcb-face": "auto",
-    "pcb-enable": [
-      "on"
-    ]
+    "pcb-face": 5,
+    "material-cost": 0.05,
+    "pcb-price": 25,
+    "batt-price": 80
   },
   "1": {
     "comp-l": 80,
