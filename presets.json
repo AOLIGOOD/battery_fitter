@@ -1,0 +1,43 @@
+{
+  "X1": {
+    "comp-l": 372,
+    "comp-w": 200,
+    "comp-h": 130,
+    "margin": 1,
+    "batt-l": 27,
+    "batt-w": 148,
+    "batt-h": 115,
+    "batt-v": 3.2,
+    "batt-ah": 50,
+    "batt-gap": 1,
+    "target-v": 48.1,
+    "target-ah": 50,
+    "pcb-l": 50,
+    "pcb-w": 30,
+    "pcb-h": 3,
+    "pcb-gap": 1,
+    "pcb-face": "auto",
+    "pcb-enable": [
+      "on"
+    ]
+  },
+  "1": {
+    "comp-l": 80,
+    "comp-w": 60,
+    "comp-h": 80,
+    "margin": 1,
+    "batt-l": 18,
+    "batt-w": 18,
+    "batt-h": 65,
+    "batt-v": 3.7,
+    "batt-ah": 2.5,
+    "batt-gap": 1,
+    "target-v": 14.7,
+    "target-ah": 5,
+    "pcb-l": 50,
+    "pcb-w": 30,
+    "pcb-h": 3,
+    "pcb-gap": 0,
+    "pcb-face": 3
+  }
+}
